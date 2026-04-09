@@ -5,6 +5,7 @@ from iqoptionapi.stable_api import IQ_Option
 
 app = Flask(__name__)
 
+# -------- CONFIG --------
 EMAIL = "maryarojas343@gmail.com"
 PASSWORD = "Arell9."
 PAR = "ETHUSD"
@@ -17,7 +18,9 @@ def init_db():
     CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         hora TEXT,
+        par TEXT,
         tipo TEXT,
+        duracion TEXT,
         resultado TEXT
     )
     """)
@@ -26,10 +29,7 @@ def init_db():
 
 init_db()
 
-# -------- BOT --------
-IQ = IQ_Option(EMAIL, PASSWORD)
-IQ.connect()
-
+# -------- INDICADORES --------
 def rsi(c):
     d = np.diff(c)
     g = np.where(d > 0, d, 0)
@@ -39,63 +39,88 @@ def rsi(c):
     rs = ag / (al if al != 0 else 1)
     return 100 - (100 / (1 + rs))
 
+def ema(data, period=20):
+    return np.convolve(data, np.ones(period)/period, mode='valid')
+
+# -------- BOT --------
+IQ = IQ_Option(EMAIL, PASSWORD)
+IQ.connect()
+
 def bot():
     while True:
         try:
-            candles = IQ.get_candles(PAR, 60, 50, time.time())
-            c = np.array([x['close'] for x in candles])
+            # sincronizar con vela
+            segundos = int(time.time()) % 60
+            time.sleep(60 - segundos)
 
-            r = rsi(c)
+            # ====== 1 MIN ======
+            candles_1m = IQ.get_candles(PAR, 60, 50, time.time())
+            close_1m = np.array([x['close'] for x in candles_1m])
+
+            # ====== 5 MIN ======
+            candles_5m = IQ.get_candles(PAR, 300, 50, time.time())
+            close_5m = np.array([x['close'] for x in candles_5m])
+
+            rsi_1m = rsi(close_1m)
+            rsi_5m = rsi(close_5m)
+
+            ema_1m = ema(close_1m)[-1]
+            precio = close_1m[-1]
+
             señal = None
+            duracion = None
 
-            if r < 30:
+            # ====== CALL ======
+            if rsi_1m < 30 and rsi_5m < 40 and precio > ema_1m:
                 señal = "CALL"
-            elif r > 70:
+                duracion = "1 MIN"
+
+            # ====== PUT ======
+            elif rsi_1m > 70 and rsi_5m > 60 and precio < ema_1m:
                 señal = "PUT"
+                duracion = "1 MIN"
+
+            # ====== SEÑAL 5 MIN (más fuerte) ======
+            if rsi_5m < 30:
+                señal = "CALL"
+                duracion = "5 MIN"
+            elif rsi_5m > 70:
+                señal = "PUT"
+                duracion = "5 MIN"
 
             if señal:
+                hora_entrada = (datetime.datetime.now() + datetime.timedelta(minutes=1)).strftime("%H:%M")
+
                 conn = sqlite3.connect("trades.db")
-                cdb = conn.cursor()
-                cdb.execute("INSERT INTO trades (hora, tipo, resultado) VALUES (?,?,?)",
-                            (datetime.datetime.now().strftime("%H:%M:%S"), señal, "PENDIENTE"))
+                c = conn.cursor()
+                c.execute("INSERT INTO trades (hora, par, tipo, duracion, resultado) VALUES (?,?,?,?,?)",
+                          (hora_entrada, PAR, señal, duracion, "PENDIENTE"))
                 conn.commit()
                 conn.close()
 
-        except:
-            pass
+        except Exception as e:
+            print("Error:", e)
 
-        time.sleep(60)
-
+# -------- THREAD --------
 threading.Thread(target=bot, daemon=True).start()
 
 # -------- HTML --------
 HTML = """
-<meta http-equiv="refresh" content="5">
-
-<h1>🔥 TRADING PANEL PRO</h1>
-
-<!-- TradingView Widget -->
-<div id="tv_chart"></div>
-<script src="https://s3.tradingview.com/tv.js"></script>
-<script>
-new TradingView.widget({
-  "container_id": "tv_chart",
-  "symbol": "BINANCE:ETHUSDT",
-  "interval": "1",
-  "width": "100%",
-  "height": 400
-});
-</script>
+<h1>🔥 BOT TRADING PRO</h1>
 
 <h2>📊 Señales</h2>
 <table border="1">
-<tr><th>Hora</th><th>Tipo</th><th>Resultado</th><th>Acción</th></tr>
+<tr>
+<th>Hora Entrada</th><th>Par</th><th>Tipo</th><th>Duración</th><th>Resultado</th><th>Acción</th>
+</tr>
 
 {% for t in trades %}
 <tr>
 <td>{{t[1]}}</td>
 <td>{{t[2]}}</td>
 <td>{{t[3]}}</td>
+<td>{{t[4]}}</td>
+<td>{{t[5]}}</td>
 <td>
 <a href="/g/{{t[0]}}">✅</a>
 <a href="/p/{{t[0]}}">❌</a>
@@ -107,6 +132,7 @@ new TradingView.widget({
 <h2>📈 Winrate: {{win}}%</h2>
 """
 
+# -------- FUNCIONES --------
 def get_trades():
     conn = sqlite3.connect("trades.db")
     c = conn.cursor()
@@ -117,11 +143,12 @@ def get_trades():
 
 def winrate():
     data = get_trades()
-    g = sum(1 for d in data if d[3]=="GANADA")
-    p = sum(1 for d in data if d[3]=="PERDIDA")
+    g = sum(1 for d in data if d[5]=="GANADA")
+    p = sum(1 for d in data if d[5]=="PERDIDA")
     t = g+p
     return round((g/t)*100,2) if t>0 else 0
 
+# -------- RUTAS --------
 @app.route("/")
 def home():
     return render_template_string(HTML, trades=get_trades(), win=winrate())
@@ -144,4 +171,5 @@ def p(id):
     conn.close()
     return redirect("/")
 
+# -------- RUN --------
 app.run(host="0.0.0.0", port=10000)
