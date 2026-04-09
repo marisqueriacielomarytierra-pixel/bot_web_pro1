@@ -1,6 +1,8 @@
 from flask import Flask, render_template_string, redirect
 import sqlite3, datetime, time, threading
 import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
 from iqoptionapi.stable_api import IQ_Option
 
 app = Flask(__name__)
@@ -42,23 +44,23 @@ def rsi(c):
 def ema(data, period=20):
     return np.convolve(data, np.ones(period)/period, mode='valid')
 
-# -------- BOT --------
+# -------- CONEXIÓN --------
 IQ = IQ_Option(EMAIL, PASSWORD)
 IQ.connect()
 
+# -------- BOT --------
 def bot():
     while True:
         try:
-            # sincronizar con vela
+            # sincronizar vela
             segundos = int(time.time()) % 60
             time.sleep(60 - segundos)
 
-            # ====== 1 MIN ======
             candles_1m = IQ.get_candles(PAR, 60, 50, time.time())
-            close_1m = np.array([x['close'] for x in candles_1m])
-
-            # ====== 5 MIN ======
             candles_5m = IQ.get_candles(PAR, 300, 50, time.time())
+
+            close_1m = np.array([x['close'] for x in candles_1m])
+            open_1m = np.array([x['open'] for x in candles_1m])
             close_5m = np.array([x['close'] for x in candles_5m])
 
             rsi_1m = rsi(close_1m)
@@ -67,24 +69,31 @@ def bot():
             ema_1m = ema(close_1m)[-1]
             precio = close_1m[-1]
 
+            vela = close_1m[-1] - open_1m[-1]
+
             señal = None
             duracion = None
 
-            # ====== CALL ======
-            if rsi_1m < 30 and rsi_5m < 40 and precio > ema_1m:
+            # CALL PRO
+            if (rsi_1m < 25 and rsi_5m < 35 and 
+                precio > ema_1m and 
+                vela > 0 and abs(vela) > 0.2):
                 señal = "CALL"
                 duracion = "1 MIN"
 
-            # ====== PUT ======
-            elif rsi_1m > 70 and rsi_5m > 60 and precio < ema_1m:
+            # PUT PRO
+            elif (rsi_1m > 75 and rsi_5m > 65 and 
+                  precio < ema_1m and 
+                  vela < 0 and abs(vela) > 0.2):
                 señal = "PUT"
                 duracion = "1 MIN"
 
-            # ====== SEÑAL 5 MIN (más fuerte) ======
-            if rsi_5m < 30:
+            # 5 MIN (más fuerte)
+            elif rsi_5m < 25:
                 señal = "CALL"
                 duracion = "5 MIN"
-            elif rsi_5m > 70:
+
+            elif rsi_5m > 75:
                 señal = "PUT"
                 duracion = "5 MIN"
 
@@ -101,17 +110,68 @@ def bot():
         except Exception as e:
             print("Error:", e)
 
-# -------- THREAD --------
 threading.Thread(target=bot, daemon=True).start()
+
+# -------- GRÁFICO --------
+def generar_grafico():
+    candles = IQ.get_candles(PAR, 60, 100, time.time())
+    df = pd.DataFrame(candles)
+    df['time'] = pd.to_datetime(df['from'], unit='s')
+
+    fig = go.Figure(data=[
+        go.Candlestick(
+            x=df['time'],
+            open=df['open'],
+            high=df['max'],
+            low=df['min'],
+            close=df['close']
+        )
+    ])
+
+    trades = get_trades()
+
+    for t in trades[:20]:
+        color = "green" if t[3] == "CALL" else "red"
+        symbol = "triangle-up" if t[3] == "CALL" else "triangle-down"
+
+        fig.add_trace(go.Scatter(
+            x=[df['time'].iloc[-1]],
+            y=[df['close'].iloc[-1]],
+            mode="markers",
+            marker=dict(size=14, color=color, symbol=symbol),
+            name=t[3]
+        ))
+
+    return fig.to_html(full_html=False)
+
+# -------- FUNCIONES --------
+def get_trades():
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    c.execute("SELECT * FROM trades ORDER BY id DESC")
+    data = c.fetchall()
+    conn.close()
+    return data
+
+def winrate():
+    data = get_trades()
+    g = sum(1 for d in data if d[5]=="GANADA")
+    p = sum(1 for d in data if d[5]=="PERDIDA")
+    t = g+p
+    return round((g/t)*100,2) if t>0 else 0
 
 # -------- HTML --------
 HTML = """
-<h1>🔥 BOT TRADING PRO</h1>
+<h1 style="color:#00ffcc;">🔥 BOT TRADING PRO</h1>
+
+<div>
+{{grafico|safe}}
+</div>
 
 <h2>📊 Señales</h2>
-<table border="1">
+<table border="1" style="color:white;background:black;">
 <tr>
-<th>Hora Entrada</th><th>Par</th><th>Tipo</th><th>Duración</th><th>Resultado</th><th>Acción</th>
+<th>Hora</th><th>Par</th><th>Tipo</th><th>Duración</th><th>Resultado</th><th>Acción</th>
 </tr>
 
 {% for t in trades %}
@@ -132,26 +192,15 @@ HTML = """
 <h2>📈 Winrate: {{win}}%</h2>
 """
 
-# -------- FUNCIONES --------
-def get_trades():
-    conn = sqlite3.connect("trades.db")
-    c = conn.cursor()
-    c.execute("SELECT * FROM trades ORDER BY id DESC")
-    data = c.fetchall()
-    conn.close()
-    return data
-
-def winrate():
-    data = get_trades()
-    g = sum(1 for d in data if d[5]=="GANADA")
-    p = sum(1 for d in data if d[5]=="PERDIDA")
-    t = g+p
-    return round((g/t)*100,2) if t>0 else 0
-
 # -------- RUTAS --------
 @app.route("/")
 def home():
-    return render_template_string(HTML, trades=get_trades(), win=winrate())
+    return render_template_string(
+        HTML,
+        trades=get_trades(),
+        win=winrate(),
+        grafico=generar_grafico()
+    )
 
 @app.route("/g/<int:id>")
 def g(id):
