@@ -2,3 +2,5 @@ flask
 numpy
 requests
 git+https://github.com/Lu-Yi-Hsun/iqoptionapi.git
+plotly
+pandas
